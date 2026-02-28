@@ -1,20 +1,19 @@
 /*
- * SIGSEGV signal handler for ghost-object detection bypass.
+ * SIGSEGV signal handler for anti-hook detection bypass.
  *
  * Background:
- *   The packer creates "ghost" objects via Unsafe.allocateInstance or JNI AllocObject
- *   (all fields are NULL), then calls a method that LSPosed has hooked. LSPosed's
- *   native bridge dereferences a NULL field pointer, causing SIGSEGV at a low address
- *   (typically 0x88c = NULL + ApplicationInfo field offset).
+ *   The packer (BangBang/梆梆) detects Xposed by checking stack traces from native
+ *   code. When Xposed is detected, the packer deliberately crashes with a null-pointer
+ *   dereference (fault addr 0x88c = NULL + struct field offset).
  *
  * Strategy:
  *   Install a process-wide SIGSEGV handler. When the fault address falls within the
- *   first page (< 0x1000), it's a null-pointer dereference — we decode the faulting
- *   ARM64 instruction, zero the destination register, and advance PC past it. This
- *   turns a fatal crash into a silent "load null" that the Java/bridge code can handle.
+ *   null page (< 0x1000), simulate a function return by setting PC to the link register
+ *   (LR / X30) and X0 to 0. This makes the crashing function return immediately with
+ *   null, allowing the caller to handle the "error" gracefully instead of killing the
+ *   process.
  *
- *   For all other SIGSEGV (non-null-page), we chain to the previous handler so that
- *   real crashes are still reported normally.
+ *   For all other SIGSEGV (non-null-page), chain to the previous handler.
  */
 
 #include <jni.h>
@@ -34,14 +33,6 @@
 /* Previous handler, so we can chain for non-ghost crashes */
 static struct sigaction old_sa;
 static volatile int handler_installed = 0;
-
-/*
- * Per-thread consecutive-catch counter.
- * If we catch too many SIGSEGV on the same thread in rapid succession,
- * we stop catching to avoid infinite skip loops.
- */
-static __thread int catch_count = 0;
-#define MAX_CATCHES_PER_THREAD 64
 
 static void chain_old_handler(int sig, siginfo_t *info, void *ucontext) {
     if (old_sa.sa_flags & SA_SIGINFO) {
@@ -64,40 +55,34 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext) {
 
     /*
      * Only intercept null-page accesses (address < 4 KB).
-     * These are null-pointer dereferences with a struct field offset,
-     * which is exactly what the ghost object detection triggers.
+     * These are null-pointer dereferences with a struct field offset —
+     * exactly the crash pattern from packer's deliberate kill mechanism.
      */
-    if (fault_addr >= 0x1000 || catch_count >= MAX_CATCHES_PER_THREAD) {
-        catch_count = 0;
+    if (fault_addr >= 0x1000) {
         chain_old_handler(sig, info, ucontext);
         return;
     }
 
 #if defined(__aarch64__)
     ucontext_t *ctx = (ucontext_t *)ucontext;
+    uint64_t lr = ctx->uc_mcontext.regs[30]; /* X30 = Link Register */
+    uint64_t old_pc = ctx->uc_mcontext.pc;
 
-    /*
-     * Decode the faulting ARM64 instruction to find the destination register.
-     * For LDR Xt, [Xn, #imm] and similar load variants, Rt is in bits [4:0].
-     * For STR, bits [4:0] is the source register — zeroing it is harmless.
-     */
-    uint64_t pc = ctx->uc_mcontext.pc;
-    uint32_t insn = *(uint32_t *)pc;
-    int rt = insn & 0x1F;
-
-    /* Zero the destination register (X0-X30); skip if SP (31) */
-    if (rt < 31) {
-        ctx->uc_mcontext.regs[rt] = 0;
+    if (lr == 0 || lr < 0x1000) {
+        /* LR is invalid (null or in null page) — can't safely return. */
+        LOGW("Cannot recover: LR=0x%lx, chaining to old handler", (unsigned long)lr);
+        chain_old_handler(sig, info, ucontext);
+        return;
     }
 
-    /* Advance past the faulting instruction (ARM64 = fixed 4 bytes) */
-    ctx->uc_mcontext.pc = pc + 4;
-    catch_count++;
+    /* Simulate function return: set PC to LR, return 0 in X0 */
+    ctx->uc_mcontext.pc = lr;
+    ctx->uc_mcontext.regs[0] = 0;  /* Return null / 0 */
 
-    LOGI("Recovered SIGSEGV at 0x%lx (insn=%08x, zeroed X%d, catch #%d)",
-         (unsigned long)fault_addr, insn, rt, catch_count);
+    LOGI("Recovered SIGSEGV at 0x%lx (PC was 0x%lx, returning to LR=0x%lx)",
+         (unsigned long)fault_addr, (unsigned long)old_pc, (unsigned long)lr);
 #else
-    /* Non-ARM64: can't safely recover, chain to old handler */
+    /* Non-ARM64: can't safely recover */
     chain_old_handler(sig, info, ucontext);
 #endif
 }
@@ -109,7 +94,7 @@ Java_com_lptiyu_tanke_hook_NativeHelper_nativeInstallHandler(JNIEnv *env, jclass
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = sigsegv_handler;
-    sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
+    sa.sa_flags     = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
 
     if (sigaction(SIGSEGV, &sa, &old_sa) == 0) {

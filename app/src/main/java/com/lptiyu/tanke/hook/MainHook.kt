@@ -7,73 +7,97 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
+import java.lang.reflect.Field
 
 class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     companion object {
         private var isBypassed = false
-
-        /**
-         * 幽灵对象标记。通过 Unsafe.allocateInstance 创建的 LoadedApk
-         * 会被打上此标记，后续 hook 据此识别并拦截。
-         */
         private const val GHOST_MARKER = "\$\$ghost_detect\$\$"
 
-        /**
-         * 重入锁：防止 getStackTrace() hook 内部触发递归调用
-         */
+        /** 重入锁：防止 getStackTrace() hook 内部触发递归调用 */
         private val isProcessing = ThreadLocal.withInitial { false }
 
+        /** StackTraceElement.declaringClass 字段，用于字段级清洗 */
+        private val declClassField: Field? by lazy {
+            try {
+                StackTraceElement::class.java.getDeclaredField("declaringClass").apply {
+                    isAccessible = true
+                }
+            } catch (_: Throwable) { null }
+        }
+
+        private val methodNameField: Field? by lazy {
+            try {
+                StackTraceElement::class.java.getDeclaredField("methodName").apply {
+                    isAccessible = true
+                }
+            } catch (_: Throwable) { null }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  检测与清洗逻辑
+        // ═══════════════════════════════════════════════════════════
+
         /**
-         * 判断单个栈帧是否属于 hook 框架的痕迹。
-         * 涵盖 LSPosed、Xposed、EdXposed、SandHook、Pine 等主流框架。
+         * 判断类名是否属于 hook 框架。
+         * 壳主要检查 className.contains("xposed")，
+         * 但我们额外覆盖所有已知框架特征。
          */
+        private fun isSuspiciousClassName(className: String): Boolean {
+            val lower = className.lowercase()
+            if (lower.contains("xposed")) return true
+            if (lower.contains("lsposed")) return true
+            if (lower.contains("lspd")) return true
+            if (lower.contains("sandhook")) return true
+            if (lower.contains("epic")) return true
+            if (lower.contains("pine")) return true
+
+            if (className.endsWith(".HookBridge") || className == "HookBridge") return true
+            if (className.startsWith("LSPHooker")) return true
+
+            return false
+        }
+
+        /** 判断单个栈帧是否属于 hook 框架 */
         private fun isSuspiciousFrame(element: StackTraceElement): Boolean {
             val className = element.className
             val methodName = element.methodName
 
-            // 主流 hook 框架的明文类名特征
-            if (className.contains("org.lsposed") ||
-                className.contains("de.robv.android.xposed") ||
-                className.contains("LSPHooker") ||
-                className.contains("com.elder.xposed") ||
-                className.contains("SandHook") ||
-                className.contains("EdXposed") ||
-                className.contains("me.weishu.epic") ||
-                className.contains("top.canyie.pine") ||
-                className.contains("com.swift.sandhook") ||
-                className.contains("lspd")
-            ) {
-                return true
-            }
+            if (isSuspiciousClassName(className)) return true
 
-            // 混淆后的 HookBridge（如 KmkyjghNEh.FrHZn.faUePQsyDyyx.HookBridge）
-            if (className.endsWith(".HookBridge") || className == "HookBridge") {
-                return true
-            }
-
-            // 混淆后的回调类：短类名 + callback 方法（如 class=J, method=callback）
-            if (className.length <= 2 && methodName == "callback") {
-                return true
-            }
-
-            // invokeOriginalMethod 是 LSPosed bridge 的核心调用
-            if (methodName == "invokeOriginalMethod") {
-                return true
-            }
+            // 混淆后的回调类：短类名 + callback
+            if (className.length <= 2 && methodName == "callback") return true
+            if (methodName == "invokeOriginalMethod") return true
+            if (methodName == "handleHookedMethod") return true
 
             return false
         }
 
         /**
-         * 清洗栈帧数组：移除所有 hook 框架痕迹，
-         * 同时移除紧随其后的反射 Method.invoke 帧（用于调用原方法的桥接层）。
+         * 直接修改 StackTraceElement 的 declaringClass 字段。
+         * 这是防御壳通过 JNI GetObjectField 直接读取字段值的最后一道防线。
+         */
+        private fun sanitizeElements(elements: Array<StackTraceElement>) {
+            val field = declClassField ?: return
+            for (element in elements) {
+                try {
+                    val cls = field.get(element) as? String ?: continue
+                    if (isSuspiciousClassName(cls)) {
+                        field.set(element, "android.os.Handler")
+                        methodNameField?.set(element, "dispatchMessage")
+                    }
+                } catch (_: Throwable) {}
+            }
+        }
+
+        /**
+         * 清洗栈帧数组：移除所有 hook 框架痕迹 + 修改残留元素的字段。
          * @return 清洗后的数组，如果无需清洗则返回 null
          */
-        private fun cleanStackTrace(elements: Array<StackTraceElement>): Array<StackTraceElement>? {
+        private fun cleanAndSanitize(elements: Array<StackTraceElement>): Array<StackTraceElement>? {
             if (elements.isEmpty()) return null
 
-            // 快速扫描：如果没有可疑帧则直接跳过，避免不必要的内存分配
             var needsScrubbing = false
             for (element in elements) {
                 if (isSuspiciousFrame(element)) {
@@ -92,7 +116,6 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     continue
                 }
 
-                // hook 框架通过反射 Method.invoke 调用原方法，一并剔除
                 if (skipNextMethodInvoke &&
                     element.className == "java.lang.reflect.Method" &&
                     element.methodName == "invoke"
@@ -105,33 +128,32 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 cleanTrace.add(element)
             }
 
-            return if (cleanTrace.size != elements.size) cleanTrace.toTypedArray() else null
+            val result = cleanTrace.toTypedArray()
+            // 额外安全：修改保留元素的字段（防止 JNI 直接读取）
+            sanitizeElements(result)
+            return result
         }
 
-        /**
-         * 安装所有绕过 hook。
-         *
-         * 核心策略：
-         * 1. 在 ghost 对象创建时填充关键字段 → 防止 LSPosed native bridge 的 SIGSEGV
-         * 2. 在 hooked 方法调用前识别 ghost 对象 → 抛出干净的 Java 异常
-         * 3. 在壳读取堆栈时清洗 hook 痕迹 → 欺骗检测逻辑
-         */
-        private fun bypassGhostInstanceDetection() {
+        // ═══════════════════════════════════════════════════════════
+        //  Hook 安装
+        // ═══════════════════════════════════════════════════════════
+
+        private fun installAllHooks() {
             if (isBypassed) return
             isBypassed = true
-            XposedBridge.log("TankeHook: Initializing anti-ghost detection...")
+            XposedBridge.log("TankeHook: Installing hooks...")
 
-            // ═══════════════════════════════════════════════════════════
-            // Hook 0: Unsafe.allocateInstance — 幽灵对象源头拦截
-            //
-            // 壳使用 Unsafe.allocateInstance(LoadedApk.class) 创建全空对象。
-            // LSPosed 的 native bridge 在处理 hooked 方法调用时，会在
-            // Java callback 之前访问对象字段（如 mApplicationInfo），
-            // 全空字段导致 null->field 的链式解引用 → SIGSEGV (fault 0x88c)。
-            //
-            // 解决：在 allocateInstance 返回后立即填充关键字段，
-            // 使 native bridge 不会遇到 null 引用链。
-            // ═══════════════════════════════════════════════════════════
+            installUnsafeHook()
+            installGhostInterceptor()
+            installStackTraceElementHooks()
+            installThrowableGetStackTraceHook()
+            installThreadGetStackTraceHook()
+            installThreadGetAllStackTracesHook()
+            installVMStackHook()
+        }
+
+        // ── Hook 0: Unsafe.allocateInstance ────────────────────────
+        private fun installUnsafeHook() {
             try {
                 val unsafeClass = Class.forName("sun.misc.Unsafe")
                 val allocMethod = unsafeClass.getDeclaredMethod("allocateInstance", Class::class.java)
@@ -139,13 +161,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val result = param.result ?: return
                         if (result.javaClass.name != "android.app.LoadedApk") return
-
                         try {
-                            // 标记 + 填充关键字段，使 native bridge 不会 SIGSEGV
                             XposedHelpers.setObjectField(result, "mPackageName", GHOST_MARKER)
-
-                            // mApplicationInfo 是 SIGSEGV 的直接元凶：
-                            // native bridge 读取 mApplicationInfo(null) 后访问其内部字段(+0x88c) → crash
                             val appInfo = ApplicationInfo()
                             appInfo.packageName = GHOST_MARKER
                             appInfo.processName = GHOST_MARKER
@@ -154,42 +171,30 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                             appInfo.nativeLibraryDir = "/dev/null"
                             appInfo.targetSdkVersion = 34
                             XposedHelpers.setObjectField(result, "mApplicationInfo", appInfo)
-                        } catch (t: Throwable) {
-                            XposedBridge.log("TankeHook: Failed to fill ghost fields: ${t.message}")
-                        }
+                        } catch (_: Throwable) {}
                     }
                 })
-                XposedBridge.log("TankeHook: Hooked Unsafe.allocateInstance (ghost field filler)")
+                XposedBridge.log("TankeHook: Hooked Unsafe.allocateInstance")
             } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook Unsafe.allocateInstance: ${e.message}")
+                XposedBridge.log("TankeHook: Failed to hook Unsafe: ${e.message}")
             }
+        }
 
-            // ═══════════════════════════════════════════════════════════
-            // Hook 1: LoadedApk.createOrUpdateClassLoaderLocked — 幽灵对象拦截器
-            //
-            // 即使 Unsafe hook 填充了字段使 native bridge 不崩溃，
-            // 我们仍需在方法执行前拦截 ghost 对象，抛出干净的 NPE。
-            // 这样壳捕获的异常堆栈经 getStackTrace() hook 清洗后完全干净。
-            //
-            // 也作为备用方案：如果壳不通过 Unsafe 创建 ghost（如直接 native 内存分配），
-            // mPackageName 仍为 null，同样被拦截。
-            // ═══════════════════════════════════════════════════════════
+        // ── Hook 1: createOrUpdateClassLoaderLocked ────────────────
+        private fun installGhostInterceptor() {
             try {
                 val loadedApkClass = XposedHelpers.findClass("android.app.LoadedApk", null)
-                val createCLMethod = XposedHelpers.findMethodExact(
-                    loadedApkClass,
-                    "createOrUpdateClassLoaderLocked",
-                    List::class.java
+                val method = XposedHelpers.findMethodExact(
+                    loadedApkClass, "createOrUpdateClassLoaderLocked", List::class.java
                 )
-                XposedBridge.hookMethod(createCLMethod, object : XC_MethodHook(10000) {
+                XposedBridge.hookMethod(method, object : XC_MethodHook(10000) {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val mPackageName = XposedHelpers.getObjectField(param.thisObject, "mPackageName")
-                            if (mPackageName == null || mPackageName == GHOST_MARKER) {
+                            val pkg = XposedHelpers.getObjectField(param.thisObject, "mPackageName")
+                            if (pkg == null || pkg == GHOST_MARKER) {
                                 param.throwable = NullPointerException(
                                     "Attempt to invoke virtual method on a null object reference"
                                 )
-                                return
                             }
                         } catch (_: Throwable) {
                             param.throwable = NullPointerException(
@@ -198,36 +203,82 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
                     }
                 })
-                XposedBridge.log("TankeHook: Hooked createOrUpdateClassLoaderLocked (ghost interceptor)")
+                XposedBridge.log("TankeHook: Hooked createOrUpdateClassLoaderLocked")
             } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook createOrUpdateClassLoaderLocked: ${e.message}")
+                XposedBridge.log("TankeHook: Failed: ${e.message}")
+            }
+        }
+
+        // ── Hook 2: StackTraceElement.getClassName / toString ──────
+        // 壳在 JNI_OnLoad 中遍历 StackTraceElement[] 并调用 getClassName()
+        // 检查是否包含 "xposed"。这是最关键的拦截点。
+        private fun installStackTraceElementHooks() {
+            // getClassName()
+            try {
+                val m = StackTraceElement::class.java.getDeclaredMethod("getClassName")
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val name = param.result as? String ?: return
+                        if (isSuspiciousClassName(name)) {
+                            param.result = "android.os.Handler"
+                        }
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked StackTraceElement.getClassName()")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed: ${e.message}")
             }
 
-            // ═══════════════════════════════════════════════════════════
-            // Hook 2: Throwable.getStackTrace() — 核心防线
-            // 壳通过 exception.getStackTrace() 读取堆栈并扫描 hook 痕迹，
-            // 在返回结果前清洗即可欺骗检测。
-            // 同时更新 Throwable 内部的 stackTrace 字段，
-            // 确保后续 printStackTrace() 也返回干净结果。
-            // ═══════════════════════════════════════════════════════════
+            // toString()
             try {
-                val getStackTraceMethod = Throwable::class.java.getDeclaredMethod("getStackTrace")
-                XposedBridge.hookMethod(getStackTraceMethod, object : XC_MethodHook() {
+                val m = StackTraceElement::class.java.getDeclaredMethod("toString")
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        // 重入保护
+                        val str = param.result as? String ?: return
+                        val lower = str.lowercase()
+                        if (lower.contains("xposed") || lower.contains("lsposed") ||
+                            lower.contains("hookbridge") || lower.contains("lsphooker")
+                        ) {
+                            param.result = "android.os.Handler.dispatchMessage(Handler.java:106)"
+                        }
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked StackTraceElement.toString()")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed: ${e.message}")
+            }
+
+            // getMethodName()
+            try {
+                val m = StackTraceElement::class.java.getDeclaredMethod("getMethodName")
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val name = param.result as? String ?: return
+                        if (name == "handleHookedMethod" || name == "invokeOriginalMethod" || name == "callback") {
+                            param.result = "dispatchMessage"
+                        }
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked StackTraceElement.getMethodName()")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed: ${e.message}")
+            }
+        }
+
+        // ── Hook 3: Throwable.getStackTrace() ──────────────────────
+        private fun installThrowableGetStackTraceHook() {
+            try {
+                val m = Throwable::class.java.getDeclaredMethod("getStackTrace")
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
                         if (isProcessing.get()) return
                         isProcessing.set(true)
                         try {
-                            val elements = param.result as? Array<*> ?: return
                             @Suppress("UNCHECKED_CAST")
-                            val stackElements = elements as? Array<StackTraceElement> ?: return
-                            val cleaned = cleanStackTrace(stackElements) ?: return
+                            val elements = param.result as? Array<StackTraceElement> ?: return
+                            val cleaned = cleanAndSanitize(elements) ?: return
                             param.result = cleaned
-                            // 持久化到 Throwable 内部，使 printStackTrace() 同样干净
-                            try {
-                                (param.thisObject as? Throwable)?.stackTrace = cleaned
-                            } catch (_: Throwable) {
-                            }
+                            try { (param.thisObject as? Throwable)?.stackTrace = cleaned } catch (_: Throwable) {}
                         } finally {
                             isProcessing.set(false)
                         }
@@ -235,24 +286,22 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 })
                 XposedBridge.log("TankeHook: Hooked Throwable.getStackTrace()")
             } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook Throwable.getStackTrace: ${e.message}")
+                XposedBridge.log("TankeHook: Failed: ${e.message}")
             }
+        }
 
-            // ═══════════════════════════════════════════════════════════
-            // Hook 3: Thread.getStackTrace() — 辅助防线
-            // 壳可能通过 Thread.currentThread().getStackTrace() 检查当前调用栈
-            // ═══════════════════════════════════════════════════════════
+        // ── Hook 4: Thread.getStackTrace() ─────────────────────────
+        private fun installThreadGetStackTraceHook() {
             try {
-                val threadGetStackTrace = Thread::class.java.getDeclaredMethod("getStackTrace")
-                XposedBridge.hookMethod(threadGetStackTrace, object : XC_MethodHook() {
+                val m = Thread::class.java.getDeclaredMethod("getStackTrace")
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         if (isProcessing.get()) return
                         isProcessing.set(true)
                         try {
-                            val elements = param.result as? Array<*> ?: return
                             @Suppress("UNCHECKED_CAST")
-                            val stackElements = elements as? Array<StackTraceElement> ?: return
-                            val cleaned = cleanStackTrace(stackElements) ?: return
+                            val elements = param.result as? Array<StackTraceElement> ?: return
+                            val cleaned = cleanAndSanitize(elements) ?: return
                             param.result = cleaned
                         } finally {
                             isProcessing.set(false)
@@ -261,36 +310,29 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 })
                 XposedBridge.log("TankeHook: Hooked Thread.getStackTrace()")
             } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook Thread.getStackTrace: ${e.message}")
+                XposedBridge.log("TankeHook: Failed: ${e.message}")
             }
+        }
 
-            // ═══════════════════════════════════════════════════════════
-            // Hook 4: Thread.getAllStackTraces() — 补充防线
-            // 壳可能枚举所有线程的堆栈来检测 hook
-            // ═══════════════════════════════════════════════════════════
+        // ── Hook 5: Thread.getAllStackTraces() ──────────────────────
+        private fun installThreadGetAllStackTracesHook() {
             try {
-                val getAllStackTraces = Thread::class.java.getDeclaredMethod("getAllStackTraces")
-                XposedBridge.hookMethod(getAllStackTraces, object : XC_MethodHook() {
+                val m = Thread::class.java.getDeclaredMethod("getAllStackTraces")
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
                     @Suppress("UNCHECKED_CAST")
                     override fun afterHookedMethod(param: MethodHookParam) {
                         if (isProcessing.get()) return
                         isProcessing.set(true)
                         try {
                             val map = param.result as? Map<Thread, Array<StackTraceElement>> ?: return
-                            var anyChanged = false
-                            val cleanedMap = LinkedHashMap<Thread, Array<StackTraceElement>>(map.size)
+                            var changed = false
+                            val cleaned = LinkedHashMap<Thread, Array<StackTraceElement>>(map.size)
                             for ((thread, elements) in map) {
-                                val cleaned = cleanStackTrace(elements)
-                                if (cleaned != null) {
-                                    cleanedMap[thread] = cleaned
-                                    anyChanged = true
-                                } else {
-                                    cleanedMap[thread] = elements
-                                }
+                                val c = cleanAndSanitize(elements)
+                                if (c != null) { cleaned[thread] = c; changed = true }
+                                else cleaned[thread] = elements
                             }
-                            if (anyChanged) {
-                                param.result = cleanedMap
-                            }
+                            if (changed) param.result = cleaned
                         } finally {
                             isProcessing.set(false)
                         }
@@ -298,24 +340,46 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 })
                 XposedBridge.log("TankeHook: Hooked Thread.getAllStackTraces()")
             } catch (e: Throwable) {
-                XposedBridge.log("TankeHook: Failed to hook Thread.getAllStackTraces: ${e.message}")
+                XposedBridge.log("TankeHook: Failed: ${e.message}")
+            }
+        }
+
+        // ── Hook 6: VMStack.getThreadStackTrace() ──────────────────
+        // 壳可能绕过 Thread.getStackTrace()，直接通过 JNI 调用
+        // dalvik.system.VMStack.getThreadStackTrace(Thread) 获取原始堆栈。
+        private fun installVMStackHook() {
+            try {
+                val vmStackClass = XposedHelpers.findClass("dalvik.system.VMStack", null)
+                val m = vmStackClass.getDeclaredMethod("getThreadStackTrace", Thread::class.java)
+                XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (isProcessing.get()) return
+                        isProcessing.set(true)
+                        try {
+                            @Suppress("UNCHECKED_CAST")
+                            val elements = param.result as? Array<StackTraceElement> ?: return
+                            val cleaned = cleanAndSanitize(elements)
+                            if (cleaned != null) param.result = cleaned
+                            else sanitizeElements(elements) // 即使不删除帧，也修改字段
+                        } finally {
+                            isProcessing.set(false)
+                        }
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked VMStack.getThreadStackTrace()")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed to hook VMStack: ${e.message}")
             }
         }
     }
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
-        // 最优先：安装 native SIGSEGV 处理器
-        // 必须在任何 Java hook 之前，因为 LSPosed 的 bootstrap hook
-        // 可能在 ghost 对象上触发 native crash
         NativeHelper.install(startupParam.modulePath)
-
-        bypassGhostInstanceDetection()
+        installAllHooks()
     }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        if (lpparam.packageName != "com.lptiyu.tanke") {
-            return
-        }
+        if (lpparam.packageName != "com.lptiyu.tanke") return
         XposedBridge.log("TankeHook: loading for ${lpparam.packageName}")
     }
 }
