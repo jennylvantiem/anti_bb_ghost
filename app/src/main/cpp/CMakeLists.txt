@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.10)
 project("anti_segv" LANGUAGES C)
 
 add_library(anti_segv SHARED anti_segv.c)
