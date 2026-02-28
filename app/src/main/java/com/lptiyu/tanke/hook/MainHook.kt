@@ -304,6 +304,11 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
+        // 最优先：安装 native SIGSEGV 处理器
+        // 必须在任何 Java hook 之前，因为 LSPosed 的 bootstrap hook
+        // 可能在 ghost 对象上触发 native crash
+        NativeHelper.install(startupParam.modulePath)
+
         bypassGhostInstanceDetection()
     }
 
