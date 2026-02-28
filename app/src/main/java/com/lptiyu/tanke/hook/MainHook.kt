@@ -1,5 +1,6 @@
 package com.lptiyu.tanke.hook
 
+import android.content.pm.ApplicationInfo
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
@@ -11,6 +12,12 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     companion object {
         private var isBypassed = false
+
+        /**
+         * 幽灵对象标记。通过 Unsafe.allocateInstance 创建的 LoadedApk
+         * 会被打上此标记，后续 hook 据此识别并拦截。
+         */
+        private const val GHOST_MARKER = "\$\$ghost_detect\$\$"
 
         /**
          * 重入锁：防止 getStackTrace() hook 内部触发递归调用
@@ -102,24 +109,70 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         }
 
         /**
-         * 安装所有堆栈清洗 hook。
-         * 策略：不 hook 任何会干扰 App 正常初始化的系统方法（如 findClass、createOrUpdateClassLoaderLocked），
-         * 只在壳读取堆栈的出口处拦截并清洗。
+         * 安装所有绕过 hook。
+         *
+         * 核心策略：
+         * 1. 在 ghost 对象创建时填充关键字段 → 防止 LSPosed native bridge 的 SIGSEGV
+         * 2. 在 hooked 方法调用前识别 ghost 对象 → 抛出干净的 Java 异常
+         * 3. 在壳读取堆栈时清洗 hook 痕迹 → 欺骗检测逻辑
          */
         private fun bypassGhostInstanceDetection() {
             if (isBypassed) return
             isBypassed = true
-            XposedBridge.log("TankeHook: Initializing stack trace scrubber...")
+            XposedBridge.log("TankeHook: Initializing anti-ghost detection...")
 
             // ═══════════════════════════════════════════════════════════
-            // Hook 0: LoadedApk.createOrUpdateClassLoaderLocked — 幽灵对象拦截器
-            // 壳使用 Unsafe.allocateInstance 创建全空的"幽灵" LoadedApk 对象，
-            // 然后调用此方法引爆异常并检查堆栈中的 hook 痕迹。
-            // 问题：LSPosed 内置 hook 此方法，native HookBridge 处理全空对象
-            // 时会触发 SIGSEGV（null+0x88c）。
-            // 解决：在 beforeHookedMethod 中（priority 最高，先于 LSPosed 的 bridge）
-            // 检测幽灵对象（mPackageName==null），直接抛出干净的 NPE，
-            // 阻止调用进入 native bridge。
+            // Hook 0: Unsafe.allocateInstance — 幽灵对象源头拦截
+            //
+            // 壳使用 Unsafe.allocateInstance(LoadedApk.class) 创建全空对象。
+            // LSPosed 的 native bridge 在处理 hooked 方法调用时，会在
+            // Java callback 之前访问对象字段（如 mApplicationInfo），
+            // 全空字段导致 null->field 的链式解引用 → SIGSEGV (fault 0x88c)。
+            //
+            // 解决：在 allocateInstance 返回后立即填充关键字段，
+            // 使 native bridge 不会遇到 null 引用链。
+            // ═══════════════════════════════════════════════════════════
+            try {
+                val unsafeClass = Class.forName("sun.misc.Unsafe")
+                val allocMethod = unsafeClass.getDeclaredMethod("allocateInstance", Class::class.java)
+                XposedBridge.hookMethod(allocMethod, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val result = param.result ?: return
+                        if (result.javaClass.name != "android.app.LoadedApk") return
+
+                        try {
+                            // 标记 + 填充关键字段，使 native bridge 不会 SIGSEGV
+                            XposedHelpers.setObjectField(result, "mPackageName", GHOST_MARKER)
+
+                            // mApplicationInfo 是 SIGSEGV 的直接元凶：
+                            // native bridge 读取 mApplicationInfo(null) 后访问其内部字段(+0x88c) → crash
+                            val appInfo = ApplicationInfo()
+                            appInfo.packageName = GHOST_MARKER
+                            appInfo.processName = GHOST_MARKER
+                            appInfo.sourceDir = "/dev/null"
+                            appInfo.dataDir = "/dev/null"
+                            appInfo.nativeLibraryDir = "/dev/null"
+                            appInfo.targetSdkVersion = 34
+                            XposedHelpers.setObjectField(result, "mApplicationInfo", appInfo)
+                        } catch (t: Throwable) {
+                            XposedBridge.log("TankeHook: Failed to fill ghost fields: ${t.message}")
+                        }
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked Unsafe.allocateInstance (ghost field filler)")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Failed to hook Unsafe.allocateInstance: ${e.message}")
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // Hook 1: LoadedApk.createOrUpdateClassLoaderLocked — 幽灵对象拦截器
+            //
+            // 即使 Unsafe hook 填充了字段使 native bridge 不崩溃，
+            // 我们仍需在方法执行前拦截 ghost 对象，抛出干净的 NPE。
+            // 这样壳捕获的异常堆栈经 getStackTrace() hook 清洗后完全干净。
+            //
+            // 也作为备用方案：如果壳不通过 Unsafe 创建 ghost（如直接 native 内存分配），
+            // mPackageName 仍为 null，同样被拦截。
             // ═══════════════════════════════════════════════════════════
             try {
                 val loadedApkClass = XposedHelpers.findClass("android.app.LoadedApk", null)
@@ -131,18 +184,14 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 XposedBridge.hookMethod(createCLMethod, object : XC_MethodHook(10000) {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            // 检查关键字段：幽灵对象所有字段均为 null
                             val mPackageName = XposedHelpers.getObjectField(param.thisObject, "mPackageName")
-                            if (mPackageName == null) {
-                                // 幽灵对象！抛出 NPE 阻止进入 native bridge
-                                // getStackTrace() hook 会在壳读取时清洗此异常的堆栈
+                            if (mPackageName == null || mPackageName == GHOST_MARKER) {
                                 param.throwable = NullPointerException(
                                     "Attempt to invoke virtual method on a null object reference"
                                 )
                                 return
                             }
                         } catch (_: Throwable) {
-                            // 字段访问失败也说明对象异常，同样拦截
                             param.throwable = NullPointerException(
                                 "Attempt to invoke virtual method on a null object reference"
                             )
@@ -155,7 +204,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
 
             // ═══════════════════════════════════════════════════════════
-            // Hook 1: Throwable.getStackTrace() — 核心防线
+            // Hook 2: Throwable.getStackTrace() — 核心防线
             // 壳通过 exception.getStackTrace() 读取堆栈并扫描 hook 痕迹，
             // 在返回结果前清洗即可欺骗检测。
             // 同时更新 Throwable 内部的 stackTrace 字段，
@@ -190,7 +239,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
 
             // ═══════════════════════════════════════════════════════════
-            // Hook 2: Thread.getStackTrace() — 辅助防线
+            // Hook 3: Thread.getStackTrace() — 辅助防线
             // 壳可能通过 Thread.currentThread().getStackTrace() 检查当前调用栈
             // ═══════════════════════════════════════════════════════════
             try {
@@ -216,7 +265,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
 
             // ═══════════════════════════════════════════════════════════
-            // Hook 3: Thread.getAllStackTraces() — 补充防线
+            // Hook 4: Thread.getAllStackTraces() — 补充防线
             // 壳可能枚举所有线程的堆栈来检测 hook
             // ═══════════════════════════════════════════════════════════
             try {
