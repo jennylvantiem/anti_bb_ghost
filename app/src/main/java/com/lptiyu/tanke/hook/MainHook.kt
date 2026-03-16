@@ -13,6 +13,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     companion object {
         private var isBypassed = false
+        private var networkBypassInstalled = false
         private const val GHOST_MARKER = "\$\$ghost_detect\$\$"
 
         /** 重入锁：防止 getStackTrace() hook 内部触发递归调用 */
@@ -371,6 +372,151 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 XposedBridge.log("TankeHook: Failed to hook VMStack: ${e.message}")
             }
         }
+
+        // ── Network hooks: for traffic capture only in target app ─────────
+        private fun installNetworkCaptureHooks(classLoader: ClassLoader?) {
+            if (networkBypassInstalled || classLoader == null) return
+            networkBypassInstalled = true
+            XposedBridge.log("TankeHook: Installing network capture hooks...")
+
+            installOssHttpDnsBypass(classLoader)
+            installOkHttpPinningBypass(classLoader)
+            installTrustManagerBypass()
+        }
+
+        private fun installOssHttpDnsBypass(classLoader: ClassLoader) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "com.alibaba.sdk.android.oss.ClientConfiguration",
+                    classLoader,
+                    "isHttpDnsEnable",
+                    object : XC_MethodHook() {
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            param.result = false
+                        }
+                    }
+                )
+                XposedBridge.log("TankeHook: Hooked ClientConfiguration.isHttpDnsEnable()")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: HttpDNS getter hook failed: ${e.message}")
+            }
+
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "com.alibaba.sdk.android.oss.ClientConfiguration",
+                    classLoader,
+                    "setHttpDnsEnable",
+                    Boolean::class.javaPrimitiveType,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            param.args[0] = false
+                        }
+                    }
+                )
+                XposedBridge.log("TankeHook: Hooked ClientConfiguration.setHttpDnsEnable(boolean)")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: HttpDNS setter hook failed: ${e.message}")
+            }
+
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "com.alibaba.sdk.android.oss.internal.InternalRequestOperation",
+                    classLoader,
+                    "checkIfHttpDnsAvailable",
+                    Boolean::class.javaPrimitiveType,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            param.result = false
+                        }
+                    }
+                )
+                XposedBridge.log("TankeHook: Hooked InternalRequestOperation.checkIfHttpDnsAvailable(boolean)")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Internal httpdns hook failed: ${e.message}")
+            }
+        }
+
+        private fun installOkHttpPinningBypass(classLoader: ClassLoader) {
+            try {
+                val certPinnerClass = XposedHelpers.findClass("okhttp3.CertificatePinner", classLoader)
+
+                val checkList = certPinnerClass.getDeclaredMethod("check", String::class.java, List::class.java)
+                XposedBridge.hookMethod(checkList, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = null
+                    }
+                })
+
+                val certArrayClass = Class.forName("[Ljava.security.cert.Certificate;")
+                val checkArray = certPinnerClass.getDeclaredMethod("check", String::class.java, certArrayClass)
+                XposedBridge.hookMethod(checkArray, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = null
+                    }
+                })
+                XposedBridge.log("TankeHook: Hooked okhttp3.CertificatePinner.check(..)")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: CertificatePinner hook failed: ${e.message}")
+            }
+
+            try {
+                val certPinnerClass = XposedHelpers.findClass("okhttp3.CertificatePinner", classLoader)
+                val defaultPinner = certPinnerClass.getDeclaredField("DEFAULT").get(null)
+
+                XposedHelpers.findAndHookMethod(
+                    "okhttp3.OkHttpClient\$Builder",
+                    classLoader,
+                    "certificatePinner",
+                    certPinnerClass,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            param.args[0] = defaultPinner
+                        }
+                    }
+                )
+                XposedBridge.log("TankeHook: Hooked OkHttpClient.Builder.certificatePinner(..)")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Builder.certificatePinner hook failed: ${e.message}")
+            }
+
+            // 业务自定义 OkHttp 包装层（本样本中出现）
+            try {
+                XposedHelpers.findAndHookMethod(
+                    "p1141g.p1433b.p1438b.p1451d.C16910p\$b",
+                    classLoader,
+                    "m75048y",
+                    XposedHelpers.findClass("okhttp3.CertificatePinner", classLoader),
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            param.args[0] = null
+                        }
+                    }
+                )
+                XposedBridge.log("TankeHook: Hooked custom builder m75048y(CertificatePinner)")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: Custom builder pinning hook failed: ${e.message}")
+            }
+        }
+
+        private fun installTrustManagerBypass() {
+            // Android Conscrypt 常见证书链校验入口
+            try {
+                val trustManagerImplClass = Class.forName("com.android.org.conscrypt.TrustManagerImpl")
+                for (method in trustManagerImplClass.declaredMethods) {
+                    if (method.name != "verifyChain") continue
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (param.args.isNotEmpty()) {
+                                param.result = param.args[0]
+                            }
+                        }
+                    })
+                }
+                XposedBridge.log("TankeHook: Hooked TrustManagerImpl.verifyChain(..)")
+            } catch (e: Throwable) {
+                XposedBridge.log("TankeHook: TrustManagerImpl hook failed: ${e.message}")
+            }
+        }
     }
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
@@ -381,5 +527,6 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         if (lpparam.packageName != "com.lptiyu.tanke") return
         XposedBridge.log("TankeHook: loading for ${lpparam.packageName}")
+        installNetworkCaptureHooks(lpparam.classLoader)
     }
 }
