@@ -18,6 +18,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         private var ossHttpDnsHooksInstalled = false
         private var okhttpHooksInstalled = false
         private var trustManagerHooksInstalled = false
+        private val hookedHostnameVerifierClasses = HashSet<String>()
         private const val GHOST_MARKER = "\$\$ghost_detect\$\$"
 
         private val permissiveHostnameVerifier = javax.net.ssl.HostnameVerifier { _, _ -> true }
@@ -403,6 +404,10 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         override fun afterHookedMethod(param: MethodHookParam) {
                             val name = param.args[0] as? String ?: return
                             val loader = param.thisObject as? ClassLoader ?: return
+                            val loadedClass = param.result as? Class<*> ?: return
+
+                            installHostnameVerifierBypassForClass(name, loadedClass)
+
                             if (!ossHttpDnsHooksInstalled && name.startsWith("com.alibaba.sdk.android.oss")) {
                                 installOssHttpDnsBypass(loader)
                             }
@@ -415,6 +420,27 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 XposedBridge.log("TankeHook: Hooked ClassLoader.loadClass for delayed network hooks")
             } catch (e: Throwable) {
                 XposedBridge.log("TankeHook: ClassLoader monitor hook failed: ${e.message}")
+            }
+        }
+
+        private fun installHostnameVerifierBypassForClass(className: String, clazz: Class<*>) {
+            if (hookedHostnameVerifierClasses.contains(className)) return
+            if (!javax.net.ssl.HostnameVerifier::class.java.isAssignableFrom(clazz)) return
+
+            try {
+                val verifyMethod = clazz.getDeclaredMethod(
+                    "verify",
+                    String::class.java,
+                    javax.net.ssl.SSLSession::class.java
+                )
+                XposedBridge.hookMethod(verifyMethod, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = true
+                    }
+                })
+                hookedHostnameVerifierClasses.add(className)
+                XposedBridge.log("TankeHook: Hooked HostnameVerifier.verify for $className")
+            } catch (_: Throwable) {
             }
         }
 
