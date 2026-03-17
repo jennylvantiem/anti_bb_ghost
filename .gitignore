@@ -9,3 +9,4 @@ local.properties
 /app/.externalNativeBuild/
 *.apk
 references/
+*.log

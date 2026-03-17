@@ -10,30 +10,58 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_API: "36"
+      BUILD_TOOLS: "36.1.0"
+      NDK_VERSION: "29.0.14206865"
+      CMAKE_VERSION: "3.22.1"
 
     steps:
-    - uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-    - name: set up JDK 17
-      uses: actions/setup-java@v3
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        cache: gradle
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
 
-    - name: Setup Android SDK
-      uses: android-actions/setup-android@v3
+      # android-actions/setup-android installs cmdline-tools and accepts licences
+      - name: Set up Android SDK (cmdline-tools + licence acceptance)
+        uses: android-actions/setup-android@v3
 
-    - name: Grant execute permission for gradlew
-      run: chmod +x gradlew
+      - name: Cache Android SDK packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.android
+            ${{ env.ANDROID_SDK_ROOT }}/platforms/android-${{ env.ANDROID_API }}
+            ${{ env.ANDROID_SDK_ROOT }}/build-tools/${{ env.BUILD_TOOLS }}
+            ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.NDK_VERSION }}
+            ${{ env.ANDROID_SDK_ROOT }}/cmake/${{ env.CMAKE_VERSION }}
+          key: android-sdk-${{ runner.os }}-${{ env.ANDROID_API }}-${{ env.BUILD_TOOLS }}-${{ env.NDK_VERSION }}-${{ env.CMAKE_VERSION }}
+          restore-keys: |
+            android-sdk-${{ runner.os }}-
 
-    - name: Build with Gradle
-      run: ./gradlew assembleRelease
+      # Explicitly install the SDK components referenced in build.gradle.kts
+      - name: Install required SDK packages
+        run: |
+          sdkmanager \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
 
-    - name: Upload APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: app-release
-        path: app/build/outputs/apk/release/*.apk
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-${{ github.sha }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30

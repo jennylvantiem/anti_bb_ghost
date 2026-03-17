@@ -24,19 +24,7 @@ import android.widget.TextView
  */
 class SettingsActivity : Activity() {
 
-    companion object {
-        const val PREFS_NAME = "tanke_hook_prefs"
-
-        // SharedPreferences key 常量，与 MainHook 共享
-        const val KEY_BYPASS_SSL         = "bypass_ssl_pinning"
-        const val KEY_DISABLE_HTTPDNS    = "disable_httpdns"
-        const val KEY_DISABLE_ADS        = "disable_ads"
-        const val KEY_SKIP_SPLASH_AD     = "skip_splash_ad"
-        const val KEY_ANTI_DETECT        = "anti_detect"
-        const val KEY_VERBOSE_LOG        = "verbose_log"
-    }
-
-    // 颜色方案（随系统深浅色变化）
+    // ── 颜色方案（随系统深浅色动态计算）────────────────────────────────
     private val isDark get() =
         (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
@@ -55,19 +43,37 @@ class SettingsActivity : Activity() {
         val defaultValue: Boolean
     )
 
-    private val entries = listOf(
-        PrefEntry(KEY_ANTI_DETECT,     "反检测（栈帧伪装）",
-            "伪造调用栈帧，绕过应用的 Xposed 框架检测", true),
-        PrefEntry(KEY_BYPASS_SSL,      "绕过 SSL Pinning",
-            "禁用证书校验与 HostnameVerifier，用于抓包分析", true),
-        PrefEntry(KEY_DISABLE_HTTPDNS, "禁用阿里云 HttpDNS",
-            "阻止 OSS SDK 使用 IP 直连，使抓包代理可以正常捕获上传流量", true),
-        PrefEntry(KEY_DISABLE_ADS,     "去广告（拦截 SDK 初始化）",
-            "阻止 YFAds / 北智融合 / 快手 KsAd 等 SDK 完成初始化", true),
-        PrefEntry(KEY_SKIP_SPLASH_AD,  "跳过启动广告",
-            "拦截 SplashActivity 中的开屏广告展示，直接进入主界面", true),
-        PrefEntry(KEY_VERBOSE_LOG,     "详细日志",
-            "在 logcat 中输出每个 Hook 命中记录（调试用）", false)
+    private data class Section(val label: String, val entries: List<PrefEntry>)
+
+    private val sections = listOf(
+        Section("抓包工具辅助", listOf(
+            PrefEntry(HookPrefs.KEY_BYPASS_SSL, "绕过 SSL Pinning",
+                "禁用证书校验与 HostnameVerifier，用于抓包分析", true),
+            PrefEntry(HookPrefs.KEY_DISABLE_HTTPDNS, "禁用阿里云 HttpDNS",
+                "阻止 OSS SDK 使用 IP 直连，使抓包代理可以正常捕获上传流量", true),
+        )),
+        Section("广告屏蔽", listOf(
+            PrefEntry(HookPrefs.KEY_DISABLE_ADS, "去广告（拦截 SDK 初始化）",
+                "阻止 YFAds / 北智融合 / 快手 KsAd 等 SDK 完成初始化", true),
+            PrefEntry(HookPrefs.KEY_SKIP_SPLASH_AD, "跳过启动广告",
+                "拦截 SplashActivity 中的开屏广告展示，直接进入主界面", true),
+        )),
+        Section("反检测", listOf(
+            PrefEntry(HookPrefs.KEY_FAKE_STACK, "伪造调用栈帧",
+                "Zygote 级别 Hook，伪造 Thread/Throwable.getStackTrace()、StackTraceElement 等", true),
+            PrefEntry(HookPrefs.KEY_BYPASS_PROXY, "屏蔽代理检测",
+                "拦截 C16270p2.m72734R()，规避 error_code 3009", true),
+            PrefEntry(HookPrefs.KEY_BYPASS_ROOT, "屏蔽 Root 检测",
+                "拦截 C16270p2.m72726J()，规避 error_code 4004（Root）", true),
+            PrefEntry(HookPrefs.KEY_BYPASS_DEBUGGER, "屏蔽调试器检测",
+                "拦截 Debug.isDebuggerConnected + C16270p2.m72766x()，规避 error_code 4004（调试器）", true),
+            PrefEntry(HookPrefs.KEY_BYPASS_VAPP, "屏蔽虚拟环境检测",
+                "拦截 C16270p2.m72733Q / m72767y()，规避 error_code 4005", true),
+        )),
+        Section("调试", listOf(
+            PrefEntry(HookPrefs.KEY_VERBOSE_LOG, "详细日志",
+                "在 logcat 中输出每个 Hook 命中记录（调试用）", false),
+        )),
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -77,13 +83,12 @@ class SettingsActivity : Activity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        // 深浅色切换时重建 UI
         buildUi()
     }
 
     @Suppress("DEPRECATION")
     private fun buildUi() {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_WORLD_READABLE)
+        val prefs = getSharedPreferences(HookPrefs.PREFS_NAME, Context.MODE_WORLD_READABLE)
 
         val root = ScrollView(this).apply {
             setBackgroundColor(colorBackground)
@@ -97,21 +102,22 @@ class SettingsActivity : Activity() {
         container.addView(buildSectionHeader("Tanke LSPosed Hook"))
         container.addView(buildCaption("设置将在下次目标应用启动时生效"))
 
-        container.addView(buildSectionLabel("功能开关"))
-        val card = buildCard()
-        entries.forEachIndexed { index, entry ->
-            val current = prefs.getBoolean(entry.key, entry.defaultValue)
-            card.addView(buildSwitchRow(entry, current, prefs, index < entries.size - 1))
+        for (section in sections) {
+            container.addView(buildSectionLabel(section.label))
+            val card = buildCard()
+            section.entries.forEachIndexed { index, entry ->
+                val current = prefs.getBoolean(entry.key, entry.defaultValue)
+                card.addView(buildSwitchRow(entry, current, prefs, index < section.entries.size - 1))
+            }
+            container.addView(card)
         }
-        container.addView(card)
 
-        container.addView(buildCaption("部分功能需要 LSPosed 框架版本 ≥ 1.9.2，且模块已激活作用域为 com.lptiyu.tanke。"))
+        container.addView(buildCaption("部分功能需要 LSPosed 框架版本 >= 1.9.2，且模块已激活作用域为 com.lptiyu.tanke。"))
 
         root.addView(container)
         setContentView(root)
         title = "Tanke Hook 设置"
 
-        // 更新系统状态栏颜色（API 21+）
         window.statusBarColor = colorBackground
         window.navigationBarColor = colorBackground
     }
